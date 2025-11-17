@@ -35,6 +35,19 @@ except Exception as e:
 # --- 3. Initialize FastAPI App ---
 app = FastAPI(title="SnapStyle API")
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://1507cc3e-8646-4587-bcef-865fd8c99e37.lovableproject.com",
+        "http://localhost:5173",  # For local testing
+        "*"  # Or use "*" to allow all origins (less secure)
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # --- 4. Refactored Core Functions ---
 
 def image_generation(image_bytes: bytes, style: str) -> (bytes, dict):
