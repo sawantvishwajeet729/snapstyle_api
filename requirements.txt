@@ -1,7 +1,6 @@
 langchain_google_genai
 langchain_core
 pillow
-streamlit
 fastapi
 uvicorn[standard]
 pydantic-settings
