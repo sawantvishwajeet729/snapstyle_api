@@ -11,7 +11,7 @@ from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 from PIL import Image
-from google import genai
+import google.generativeai as genai
 from google.genai import types
 
 # --- 1. Settings Management (Replaces st.secrets) ---
