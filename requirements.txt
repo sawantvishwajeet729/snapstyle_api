@@ -1,10 +1,8 @@
-langchain_google_genai
-langchain_core
-pillow
 fastapi
 uvicorn[standard]
+gunicorn
 pydantic-settings
 python-multipart
+pillow
 google-generativeai
 requests
-gunicorn
