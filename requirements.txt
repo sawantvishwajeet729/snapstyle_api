@@ -1,7 +1,6 @@
 langchain_google_genai
 langchain_core
 pillow
-google
 streamlit
 fastapi
 uvicorn[standard]
