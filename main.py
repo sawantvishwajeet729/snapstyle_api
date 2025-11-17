@@ -8,22 +8,39 @@ from io import BytesIO
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 from PIL import Image
 import google.generativeai as genai
 
-# --- 1. Settings Management (Replaces st.secrets) ---
-class Settings(BaseSettings):
-    GOOGLE_API_KEY: str
-    CSE_ID: str
+# --- Initialize FastAPI ---
+app = FastAPI()
 
-    class Config:
-        env_file = ".env"
+# --- Add CORS Middleware BEFORE routes ---
+app.add_middleware(
+CORSMiddleware,
+allow_origins=[
+"https://1507cc3e-8646-4587-bcef-865fd8c99e37.lovableproject.com",
+"http://localhost:5173",
+"*"
+],
+allow_credentials=True,
+allow_methods=["*"],
+allow_headers=["*"],
+)
+
+# --- 1. Settings Management (Replaces st.secrets) ---
+# (Your existing code from main.py continues below...)
+
+# Example continuation placeholder:
+class Settings(BaseSettings):
+GOOGLE_API_KEY: str
+CSE_ID: str
 
 @lru_cache
 def get_settings():
-    return Settings()
+return Settings()
 
 # --- 2. Configure Google API Key at Startup ---
 try:
