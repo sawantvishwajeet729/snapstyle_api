@@ -12,10 +12,8 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 from PIL import Image
 import google.generativeai as genai
-from google.genai import types
 
 # --- 1. Settings Management (Replaces st.secrets) ---
-# Reads variables from a .env file (create this file)
 class Settings(BaseSettings):
     GOOGLE_API_KEY: str
     CSE_ID: str
@@ -23,16 +21,14 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
 
-# Dependency to get settings, cached for efficiency
 @lru_cache
 def get_settings():
     return Settings()
 
 # --- 2. Configure Google API Key at Startup ---
-# Load settings and set the environment variable for genai
 try:
     settings = get_settings()
-    os.environ["GOOGLE_API_KEY"] = settings.GOOGLE_API_KEY
+    genai.configure(api_key=settings.GOOGLE_API_KEY)
 except Exception as e:
     print(f"Warning: Could not load .env file. Make sure it exists. Error: {e}")
 
@@ -52,15 +48,11 @@ def image_generation(image_bytes: bytes, style: str) -> (bytes, dict):
     Returns:
         A tuple of (image_output_bytes, description_json)
     """
-    # Define the gemini model
-    # The client will use the GOOGLE_API_KEY from the environment
-    client = genai.Client()
-
     prompt = (
         f"**Task**: Generate a new fashion image based on the person in the provided image, PLUS a JSON text description of the new outfit.\n"
         f"**Style**: {style}\n\n"
         "**Instructions for Generation**:\n"
-        "1.  **Image Analysis**: First, carefully analyze the provided image...\n" # (Your full prompt)
+        "1.  **Image Analysis**: First, carefully analyze the provided image...\n"
         "2.  **Outfit Design**: Based on your analysis, design a complete outfit...\n"
         "3.  **Text Description**: Provide a detailed, search-friendly JSON description...\n\n"
         "**Required Description Format (JSON)**:\n"
@@ -77,18 +69,18 @@ def image_generation(image_bytes: bytes, style: str) -> (bytes, dict):
         # Open image from bytes
         image = Image.open(BytesIO(image_bytes))
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-image", # Or your preferred model
-            contents=[prompt, image],
-        )
+        # Initialize model
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        response = model.generate_content([prompt, image])
 
         generated_image_pil = None
         description_raw_text = ""
 
+        # Extract text and image from response
         for part in response.candidates[0].content.parts:
-            if part.text is not None:
+            if hasattr(part, 'text') and part.text:
                 description_raw_text += part.text
-            elif part.inline_data is not None:
+            elif hasattr(part, 'inline_data') and part.inline_data:
                 generated_image_pil = Image.open(BytesIO(part.inline_data.data))
 
         description_json = {}
@@ -133,7 +125,7 @@ def google_product_search(query: str, api_key: str, cse_id: str, num: int = 5) -
 
     try:
         response = requests.get(url, params=params)
-        response.raise_for_status() # Raise an exception for bad status codes
+        response.raise_for_status()
         data = response.json()
 
         results = []
@@ -151,7 +143,6 @@ def google_product_search(query: str, api_key: str, cse_id: str, num: int = 5) -
 
 
 # --- 5. API Response Models (Pydantic) ---
-# These define the structure of your API's JSON responses
 class GenerationResponse(BaseModel):
     description: dict
     image_base64: str
@@ -174,19 +165,14 @@ async def create_fashion_image(
 ):
     """
     Generates a new fashion image and outfit description.
-    
-    Accepts multipart/form-data with a 'style' field and a 'file' field.
-    Returns a JSON object with the description and a base64-encoded PNG image.
     """
     if not file.content_type in ["image/png", "image/jpeg"]:
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload PNG or JPG.")
 
     image_bytes = await file.read()
     
-    # Run the generation function
     generated_image_bytes, description_json = image_generation(image_bytes, style)
     
-    # Encode the resulting image bytes as base64
     image_base64_string = base64.b64encode(generated_image_bytes).decode('utf-8')
     
     return GenerationResponse(
@@ -214,7 +200,6 @@ async def search_for_products(
     )
     return SearchResponse(results=search_results)
 
-# --- 7. (Optional) Root endpoint for testing ---
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the SnapStyle API. Go to /docs for more."}
