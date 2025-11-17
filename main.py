@@ -14,43 +14,42 @@ from pydantic_settings import BaseSettings
 from PIL import Image
 import google.generativeai as genai
 
-# --- Initialize FastAPI ---
-app = FastAPI()
+# --- Initialize FastAPI (single instance) ---
+app = FastAPI(title="SnapStyle API")
 
 # --- Add CORS Middleware BEFORE routes ---
 app.add_middleware(
-CORSMiddleware,
-allow_origins=[
-"https://1507cc3e-8646-4587-bcef-865fd8c99e37.lovableproject.com",
-"http://localhost:5173",
-"*"
-],
-allow_credentials=True,
-allow_methods=["*"],
-allow_headers=["*"],
+    CORSMiddleware,
+    allow_origins=[
+        "https://1507cc3e-8646-4587-bcef-865fd8c99e37.lovableproject.com",
+        "http://localhost:5173",
+        "*"  # note: "*" is permissive; remove if you want strict origins
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --- 1. Settings Management (Replaces st.secrets) ---
-# (Your existing code from main.py continues below...)
-
-# Example continuation placeholder:
 class Settings(BaseSettings):
-GOOGLE_API_KEY: str
-CSE_ID: str
+    GOOGLE_API_KEY: str
+    CSE_ID: str
 
-@lru_cache
+    class Config:
+        env_file = ".env"
+
+@lru_cache()
 def get_settings():
-return Settings()
+    return Settings()
 
 # --- 2. Configure Google API Key at Startup ---
 try:
     settings = get_settings()
-    genai.configure(api_key=settings.GOOGLE_API_KEY)
+    # Only configure if key exists
+    if getattr(settings, "GOOGLE_API_KEY", None):
+        genai.configure(api_key=settings.GOOGLE_API_KEY)
 except Exception as e:
-    print(f"Warning: Could not load .env file. Make sure it exists. Error: {e}")
-
-# --- 3. Initialize FastAPI App ---
-app = FastAPI(title="SnapStyle API")
+    print(f"Warning: Could not load .env file or configure Google API. Error: {e}")
 
 # --- 4. Refactored Core Functions ---
 
@@ -65,29 +64,32 @@ def image_generation(image_bytes: bytes, style: str) -> (bytes, dict):
     Returns:
         A tuple of (image_output_bytes, description_json)
     """
-    prompt = (
-        f"**Task**: Generate a new fashion image based on the person in the provided image, PLUS a JSON text description of the new outfit.\n"
-        f"**Style**: {style}\n\n"
-        "**Instructions for Generation**:\n"
-        "1.  **Image Analysis**: First, carefully analyze the provided image...\n"
-        "2.  **Outfit Design**: Based on your analysis, design a complete outfit...\n"
-        "3.  **Text Description**: Provide a detailed, search-friendly JSON description...\n\n"
-        "**Required Description Format (JSON)**:\n"
-        "Respond ONLY with a JSON object. Example:\n"
-        "```json\n"
-        "{\n"
-        "  \"Shirt\": \"Men's light wash denim button-up shirt\",\n"
-        "  \"Bottoms\": \"Men's slim-fit olive green chino pants\"\n"
-        "}\n"
-        "```"
-    )
+    # Use a triple-quoted f-string and double braces for literal JSON example braces
+    prompt = f"""**Task**: Generate a new fashion image based on the person in the provided image, PLUS a JSON text description of the new outfit.
+**Style**: {style}
+
+**Instructions for Generation**:
+1.  **Image Analysis**: First, carefully analyze the provided image...
+2.  **Outfit Design**: Based on your analysis, design a complete outfit...
+3.  **Text Description**: Provide a detailed, search-friendly JSON description...
+
+**Required Description Format (JSON)**:
+Respond ONLY with a JSON object. Example:
+```json
+{{
+  "Shirt": "Men's light wash denim button-up shirt",
+  "Bottoms": "Men's slim-fit olive green chino pants"
+}}
+```"""
 
     try:
         # Open image from bytes
         image = Image.open(BytesIO(image_bytes))
 
-        # Initialize model
+        # Initialize model (ensure you have the correct model name & client usage)
         model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        # NOTE: model.generate_content signature / usage might differ depending on the SDK version.
+        # The following assumes the SDK accepts a list with prompt and inline image. Update if needed.
         response = model.generate_content([prompt, image])
 
         generated_image_pil = None
@@ -98,6 +100,7 @@ def image_generation(image_bytes: bytes, style: str) -> (bytes, dict):
             if hasattr(part, 'text') and part.text:
                 description_raw_text += part.text
             elif hasattr(part, 'inline_data') and part.inline_data:
+                # inline_data.data is assumed to be bytes of an image
                 generated_image_pil = Image.open(BytesIO(part.inline_data.data))
 
         description_json = {}
@@ -108,18 +111,16 @@ def image_generation(image_bytes: bytes, style: str) -> (bytes, dict):
                     json_string = json_match.group(1).strip()
                 else:
                     json_string = description_raw_text.strip()
-                
                 description_json = json.loads(json_string)
             except json.JSONDecodeError:
                 print(f"Failed to decode JSON from: {description_raw_text}")
                 description_json = {"error": "Failed to parse description JSON"}
-        
+
         if generated_image_pil:
             # Convert PIL image to bytes for API response
             img_buffer = BytesIO()
             generated_image_pil.save(img_buffer, format="PNG")
             image_output_bytes = img_buffer.getvalue()
-            
             return image_output_bytes, description_json
         else:
             raise HTTPException(status_code=500, detail="No image was generated by the model.")
@@ -137,6 +138,7 @@ def google_product_search(query: str, api_key: str, cse_id: str, num: int = 5) -
         "key": api_key,
         "cx": cse_id,
         "num": num,
+        # If you want images only, use "searchType": "image", otherwise remove
         "searchType": "image"
     }
 
@@ -149,9 +151,9 @@ def google_product_search(query: str, api_key: str, cse_id: str, num: int = 5) -
         for item in data.get("items", []):
             results.append({
                 "title": item.get("title"),
-                "link": item.get("image", {}).get("contextLink"),
+                "link": (item.get("image") or {}).get("contextLink") or item.get("link"),
                 "image_url": item.get("link"),
-                "thumbnail_url": item.get("image", {}).get("thumbnailLink")
+                "thumbnail_url": (item.get("image") or {}).get("thumbnailLink")
             })
         return results
     except requests.RequestException as e:
@@ -173,6 +175,7 @@ class SearchItem(BaseModel):
 class SearchResponse(BaseModel):
     results: List[SearchItem]
 
+
 # --- 6. API Endpoints ---
 
 @app.post("/generate-fashion", response_model=GenerationResponse)
@@ -183,15 +186,13 @@ async def create_fashion_image(
     """
     Generates a new fashion image and outfit description.
     """
-    if not file.content_type in ["image/png", "image/jpeg"]:
+    if file.content_type not in ["image/png", "image/jpeg"]:
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload PNG or JPG.")
 
     image_bytes = await file.read()
-    
     generated_image_bytes, description_json = image_generation(image_bytes, style)
-    
     image_base64_string = base64.b64encode(generated_image_bytes).decode('utf-8')
-    
+
     return GenerationResponse(
         description=description_json,
         image_base64=image_base64_string
@@ -201,22 +202,4 @@ async def create_fashion_image(
 @app.get("/search-products", response_model=SearchResponse)
 async def search_for_products(
     query: str,
-    settings: Settings = Depends(get_settings)
-):
-    """
-    Searches for products using the Google Custom Search Engine.
-    """
-    if not query:
-        raise HTTPException(status_code=400, detail="A 'query' parameter is required.")
-        
-    search_results = google_product_search(
-        query=query,
-        api_key=settings.GOOGLE_API_KEY,
-        cse_id=settings.CSE_ID,
-        num=5
-    )
-    return SearchResponse(results=search_results)
-
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the SnapStyle API. Go to /docs for more."}
+    setti
