@@ -8,6 +8,7 @@ from io import BytesIO
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 from PIL import Image
