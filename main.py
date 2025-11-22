@@ -2,41 +2,81 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image
-import google.generativeai as genai
 from io import BytesIO
 import json
 import re
 import base64
 import os
 import requests
+import sys
 
+# Create app first
 app = FastAPI(title="SnapStyle API")
 
-# Enable CORS for your frontend
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with your specific domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize Gemini
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+# Global variables
+genai_configured = False
+genai = None
+
+def configure_genai():
+    """Configure Gemini API with error handling"""
+    global genai_configured, genai
+    try:
+        import google.generativeai as genai_module
+        genai = genai_module
+        
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            print("WARNING: GOOGLE_API_KEY not set", file=sys.stderr)
+            return False
+            
+        genai.configure(api_key=api_key)
+        genai_configured = True
+        print("✓ Gemini API configured successfully", file=sys.stderr)
+        return True
+    except Exception as e:
+        print(f"ERROR configuring Gemini: {e}", file=sys.stderr)
+        return False
+
+# Try to configure on startup
+configure_genai()
 
 # Google Custom Search API credentials
-GOOGLE_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
+GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
 GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 
 
 @app.get("/")
 async def root():
+    """Root endpoint - shows API status"""
     return {
         "message": "SnapStyle API is running",
+        "status": "healthy",
+        "gemini_configured": genai_configured,
+        "search_configured": bool(GOOGLE_SEARCH_API_KEY and GOOGLE_CSE_ID),
         "endpoints": {
-            "/generate-fashion": "POST - Generate fashion description from image",
+            "/health": "GET - Health check",
+            "/generate-fashion": "POST - Generate fashion recommendations",
             "/search-products": "POST - Search for fashion products"
         }
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": "SnapStyle API",
+        "gemini": "configured" if genai_configured else "not configured"
     }
 
 
@@ -46,18 +86,33 @@ async def generate_fashion(
     style: str = Form(...)
 ):
     """
-    Generate fashion recommendations based on uploaded photo and style preference.
-    
-    Args:
-        file: Image file (jpg/png)
-        style: Style type (Casual, Modern, Stylish, Traditional)
-    
-    Returns:
-        JSON with generated image (base64) and outfit description
+    Generate fashion recommendations based on uploaded photo.
     """
     try:
+        # Check if Gemini is configured
+        if not genai_configured:
+            # Try to configure again
+            if not configure_genai():
+                raise HTTPException(
+                    status_code=503,
+                    detail="Gemini API not configured. Please set GOOGLE_API_KEY environment variable."
+                )
+        
+        # Validate file
+        if not file.content_type.startswith('image/'):
+            raise HTTPException(
+                status_code=400,
+                detail="File must be an image (jpg, png, etc.)"
+            )
+        
         # Read and validate image
         contents = await file.read()
+        if len(contents) > 10 * 1024 * 1024:  # 10MB limit
+            raise HTTPException(
+                status_code=400,
+                detail="Image too large. Maximum size is 10MB."
+            )
+            
         image = Image.open(BytesIO(contents))
         
         # Validate style
@@ -68,68 +123,59 @@ async def generate_fashion(
                 detail=f"Invalid style. Choose from: {', '.join(valid_styles)}"
             )
         
-        # Create prompt for outfit analysis and recommendation
-        prompt = (
-            f"**Task**: Analyze the person in the provided image and suggest a complete {style} style outfit.\n\n"
-            "**Instructions**:\n"
-            "1. **Analyze the person's features**:\n"
-            "   - Skin tone and complexion\n"
-            "   - Body type and proportions\n"
-            "   - Current style (if visible)\n"
-            "   - Background and setting\n\n"
-            f"2. **Design a complete {style} outfit** that:\n"
-            "   - Complements their skin tone\n"
-            "   - Flatters their body type\n"
-            f"   - Matches the {style} aesthetic\n"
-            "   - Is practical and fashionable\n\n"
-            "3. **Provide outfit details in JSON format**:\n"
-            "Return ONLY a valid JSON object with these keys (omit any that don't apply):\n"
-            "{\n"
-            '  "Top": "Description of shirt/blouse/jacket",\n'
-            '  "Bottom": "Description of pants/skirt/shorts",\n'
-            '  "Footwear": "Description of shoes",\n'
-            '  "Outerwear": "Description of jacket/coat (if applicable)",\n'
-            '  "Accessories": "Description of accessories (if applicable)"\n'
-            "}\n\n"
-            "Make each description detailed and search-friendly (include colors, materials, style details).\n"
-            "Example: 'Navy blue slim-fit cotton chinos' or 'Cream colored cable-knit cashmere sweater'"
-        )
-        
-        # Initialize the model
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
-        
+        # Create prompt
+        prompt = f"""Analyze this person's photo and recommend a {style} outfit.
+
+IMPORTANT: Respond with ONLY a JSON object, no other text.
+
+Required format:
+{{
+  "analysis": {{
+    "skin_tone": "description",
+    "body_type": "description"
+  }},
+  "outfit": {{
+    "Top": "specific item description",
+    "Bottom": "specific item description",
+    "Footwear": "specific item description",
+    "Accessories": "optional items"
+  }},
+  "colors": ["color1", "color2", "color3"]
+}}
+
+Make descriptions searchable (include colors, materials, styles)."""
+
         # Generate content
-        response = model.generate_content([prompt, image])
+        try:
+            model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            response = model.generate_content([prompt, image])
+            description_text = response.text if hasattr(response, 'text') else ""
+        except Exception as e:
+            print(f"Gemini API error: {e}", file=sys.stderr)
+            raise HTTPException(
+                status_code=500,
+                detail=f"AI generation failed: {str(e)}"
+            )
         
-        # Get the text response
-        description_raw_text = response.text if hasattr(response, 'text') else ""
-        
-        # Parse JSON description
+        # Parse JSON response
         description_json = {}
-        if description_raw_text:
+        if description_text:
             try:
-                # Try to extract JSON from markdown code blocks
-                json_match = re.search(r"```json\s*\n(.*?)\n\s*```", description_raw_text, re.DOTALL)
+                # Extract JSON
+                json_match = re.search(r'\{.*\}', description_text, re.DOTALL)
                 if json_match:
-                    json_string = json_match.group(1).strip()
+                    description_json = json.loads(json_match.group(0))
                 else:
-                    # Try to find JSON object directly
-                    json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', description_raw_text, re.DOTALL)
-                    if json_match:
-                        json_string = json_match.group(0)
-                    else:
-                        json_string = description_raw_text.strip()
-                
-                description_json = json.loads(json_string)
-            except json.JSONDecodeError as e:
-                print(f"JSON decode error: {e}")
-                print(f"Raw text: {description_raw_text}")
-                # Create structured response from text
+                    # Fallback
+                    description_json = {
+                        "outfit": {"description": description_text[:500]}
+                    }
+            except json.JSONDecodeError:
                 description_json = {
-                    "Outfit": description_raw_text[:500]
+                    "outfit": {"description": description_text[:500]}
                 }
         
-        # Convert original image to base64 (since Gemini can't generate images)
+        # Convert image to base64
         buffered = BytesIO()
         image.save(buffered, format="PNG")
         img_base64 = base64.b64encode(buffered.getvalue()).decode()
@@ -138,62 +184,63 @@ async def generate_fashion(
             "success": True,
             "image_base64": img_base64,
             "description": description_json,
-            "note": "Image shows your original photo. Use the outfit description to shop for items."
+            "style_requested": style
         })
             
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error in generate_fashion: {str(e)}")
+        print(f"Error in generate_fashion: {str(e)}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
-            detail=f"Error generating fashion: {str(e)}"
+            detail=f"Error: {str(e)}"
         )
 
 
 @app.post("/search-products")
-async def search_products(description: str = Form(...), num_results: int = Form(5)):
-    """
-    Search for fashion products using Google Custom Search API.
-    
-    Args:
-        description: Product description to search for
-        num_results: Number of results to return (default: 5)
-    
-    Returns:
-        JSON with search results including product links and images
-    """
+async def search_products(
+    description: str = Form(...),
+    num_results: int = Form(5)
+):
+    """Search for fashion products using Google Custom Search."""
     try:
-        if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
-            raise HTTPException(
-                status_code=500,
-                detail="Google Search API credentials not configured"
-            )
+        if not GOOGLE_SEARCH_API_KEY or not GOOGLE_CSE_ID:
+            return JSONResponse({
+                "success": False,
+                "error": "Google Search not configured",
+                "results": []
+            })
         
         url = "https://www.googleapis.com/customsearch/v1"
         params = {
             "q": description + " buy online",
-            "key": GOOGLE_API_KEY,
+            "key": GOOGLE_SEARCH_API_KEY,
             "cx": GOOGLE_CSE_ID,
             "num": min(num_results, 10),
             "searchType": "image"
         }
         
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=10)
         
         if response.status_code != 200:
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=f"Google Search API error: {response.text}"
-            )
+            print(f"Search API error: {response.status_code}", file=sys.stderr)
+            return JSONResponse({
+                "success": False,
+                "error": "Search failed",
+                "results": []
+            })
         
         data = response.json()
-        
         results = []
+        
         for item in data.get("items", []):
             results.append({
-                "title": item.get("title"),
-                "link": item.get("image", {}).get("contextLink"),
-                "image": item.get("link"),
-                "thumbnail": item.get("image", {}).get("thumbnailLink")
+                "title": item.get("title", ""),
+                "link": item.get("image", {}).get("contextLink", ""),
+                "image": item.get("link", ""),
+                "thumbnail": item.get("image", {}).get("thumbnailLink", "")
             })
         
         return JSONResponse({
@@ -203,19 +250,28 @@ async def search_products(description: str = Form(...), num_results: int = Form(
         })
         
     except Exception as e:
-        print(f"Error in search_products: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error searching products: {str(e)}"
-        )
+        print(f"Error in search_products: {str(e)}", file=sys.stderr)
+        return JSONResponse({
+            "success": False,
+            "error": str(e),
+            "results": []
+        })
 
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for monitoring"""
-    return {"status": "healthy", "message": "SnapStyle API is running"}
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    """Run on startup"""
+    print("=" * 50, file=sys.stderr)
+    print("SnapStyle API Starting...", file=sys.stderr)
+    print(f"Python version: {sys.version}", file=sys.stderr)
+    print(f"Gemini configured: {genai_configured}", file=sys.stderr)
+    print(f"Search configured: {bool(GOOGLE_SEARCH_API_KEY and GOOGLE_CSE_ID)}", file=sys.stderr)
+    print("=" * 50, file=sys.stderr)
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    port = int(os.getenv("PORT", 8000))
+    print(f"Starting server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
