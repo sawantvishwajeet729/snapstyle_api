@@ -9,7 +9,6 @@ import re
 import base64
 import os
 import requests
-from typing import Optional
 
 app = FastAPI(title="SnapStyle API")
 
@@ -22,10 +21,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Gemini client (make sure to set GOOGLE_API_KEY environment variable)
-client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+# Initialize Gemini
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# Google Custom Search API credentials (set as environment variables)
+# Google Custom Search API credentials
 GOOGLE_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
 GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 
@@ -35,7 +34,7 @@ async def root():
     return {
         "message": "SnapStyle API is running",
         "endpoints": {
-            "/generate-fashion": "POST - Generate fashion image and description",
+            "/generate-fashion": "POST - Generate fashion description from image",
             "/search-products": "POST - Search for fashion products"
         }
     }
@@ -47,7 +46,7 @@ async def generate_fashion(
     style: str = Form(...)
 ):
     """
-    Generate a fashion image based on uploaded photo and style preference.
+    Generate fashion recommendations based on uploaded photo and style preference.
     
     Args:
         file: Image file (jpg/png)
@@ -69,86 +68,78 @@ async def generate_fashion(
                 detail=f"Invalid style. Choose from: {', '.join(valid_styles)}"
             )
         
-        # Create prompt
+        # Create prompt for outfit analysis and recommendation
         prompt = (
-            f"**Task**: Generate a new fashion image based on the person in the provided image, PLUS a JSON text description of the new outfit.\n"
-            f"**Style**: {style}\n\n"
-            "**Instructions for Generation**:\n"
-            "1.  **Image Analysis**: First, carefully analyze the provided image to understand the person's:\n"
-            "    * **Skin Tone**: Identify their skin complexion.\n"
-            "    * **Body Type**: Assess their general body shape and proportions.\n"
-            "    * **Background Context**: Observe the setting and colors in the background of the original image.\n"
-            "2.  **Outfit Design**: Design a complete outfit that fits the specified '{style}' style, ensuring that:\n"
-            "    * The clothing colors are chosen appropriately to complement the identified skin tone and the overall background context.\n"
-            "    * The outfit flatters the person's body type.\n"
-            "    * The person from the original image is depicted wearing this new outfit.\n"
-            "3.  **Text Description**: Provide a detailed, search-friendly JSON description of the *new* outfit you just created. Each distinct apparel item should be a separate key-value pair. If an item consists of multiple layers (e.g., shirt and t-shirt), list them under appropriate, separate keys.\n\n"
-            "**Required Description Format (JSON)**:\n"
-            "Respond ONLY with a JSON object. Each key should represent a distinct apparel or accessory category. The value for each key should be a search-friendly string description. If an item is not applicable or not visible, omit its key.\n"
-            "Example:\n"
-            "```json\n"
+            f"**Task**: Analyze the person in the provided image and suggest a complete {style} style outfit.\n\n"
+            "**Instructions**:\n"
+            "1. **Analyze the person's features**:\n"
+            "   - Skin tone and complexion\n"
+            "   - Body type and proportions\n"
+            "   - Current style (if visible)\n"
+            "   - Background and setting\n\n"
+            f"2. **Design a complete {style} outfit** that:\n"
+            "   - Complements their skin tone\n"
+            "   - Flatters their body type\n"
+            f"   - Matches the {style} aesthetic\n"
+            "   - Is practical and fashionable\n\n"
+            "3. **Provide outfit details in JSON format**:\n"
+            "Return ONLY a valid JSON object with these keys (omit any that don't apply):\n"
             "{\n"
-            '  "Shirt": "Men\'s light wash denim button-up shirt",\n'
-            '  "Innerwear": "White crew neck t-shirt",\n'
-            '  "Bottoms": "Men\'s slim-fit olive green chino pants",\n'
-            '  "Shoes": "Men\'s white canvas low-top sneakers",\n'
-            '  "Accessory 1": "Silver watch",\n'
-            '  "Accessory 2": "Brown leather belt"\n'
-            "}\n"
-            "```\n"
-            "Ensure all descriptions are distinct and optimized for product search."
+            '  "Top": "Description of shirt/blouse/jacket",\n'
+            '  "Bottom": "Description of pants/skirt/shorts",\n'
+            '  "Footwear": "Description of shoes",\n'
+            '  "Outerwear": "Description of jacket/coat (if applicable)",\n'
+            '  "Accessories": "Description of accessories (if applicable)"\n'
+            "}\n\n"
+            "Make each description detailed and search-friendly (include colors, materials, style details).\n"
+            "Example: 'Navy blue slim-fit cotton chinos' or 'Cream colored cable-knit cashmere sweater'"
         )
         
-        # Generate content using Gemini
-        response = client.models.generate_content(
-            model="gemini-2.0-flash-exp",
-            contents=[prompt, image],
-        )
+        # Initialize the model
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
         
-        generated_image = None
-        description_raw_text = ""
+        # Generate content
+        response = model.generate_content([prompt, image])
         
-        # Extract image and text from response
-        for part in response.candidates[0].content.parts:
-            if part.text is not None:
-                description_raw_text += part.text
-            elif part.inline_data is not None:
-                generated_image = Image.open(BytesIO(part.inline_data.data))
+        # Get the text response
+        description_raw_text = response.text if hasattr(response, 'text') else ""
         
         # Parse JSON description
         description_json = {}
         if description_raw_text:
             try:
                 # Try to extract JSON from markdown code blocks
-                json_match = re.search(r"```json\n(.*?)```", description_raw_text, re.DOTALL)
+                json_match = re.search(r"```json\s*\n(.*?)\n\s*```", description_raw_text, re.DOTALL)
                 if json_match:
                     json_string = json_match.group(1).strip()
                 else:
-                    json_string = description_raw_text.strip()
+                    # Try to find JSON object directly
+                    json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', description_raw_text, re.DOTALL)
+                    if json_match:
+                        json_string = json_match.group(0)
+                    else:
+                        json_string = description_raw_text.strip()
                 
                 description_json = json.loads(json_string)
             except json.JSONDecodeError as e:
                 print(f"JSON decode error: {e}")
                 print(f"Raw text: {description_raw_text}")
-                # Return raw text as fallback
-                description_json = {"description": description_raw_text}
+                # Create structured response from text
+                description_json = {
+                    "Outfit": description_raw_text[:500]
+                }
         
-        # Convert image to base64
-        if generated_image:
-            buffered = BytesIO()
-            generated_image.save(buffered, format="PNG")
-            img_base64 = base64.b64encode(buffered.getvalue()).decode()
-            
-            return JSONResponse({
-                "success": True,
-                "image_base64": img_base64,
-                "description": description_json
-            })
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail="No image was generated"
-            )
+        # Convert original image to base64 (since Gemini can't generate images)
+        buffered = BytesIO()
+        image.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode()
+        
+        return JSONResponse({
+            "success": True,
+            "image_base64": img_base64,
+            "description": description_json,
+            "note": "Image shows your original photo. Use the outfit description to shop for items."
+        })
             
     except Exception as e:
         print(f"Error in generate_fashion: {str(e)}")
@@ -179,10 +170,10 @@ async def search_products(description: str = Form(...), num_results: int = Form(
         
         url = "https://www.googleapis.com/customsearch/v1"
         params = {
-            "q": description,
+            "q": description + " buy online",
             "key": GOOGLE_API_KEY,
             "cx": GOOGLE_CSE_ID,
-            "num": min(num_results, 10),  # Google API max is 10
+            "num": min(num_results, 10),
             "searchType": "image"
         }
         
@@ -222,7 +213,7 @@ async def search_products(description: str = Form(...), num_results: int = Form(
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring"""
-    return {"status": "healthy"}
+    return {"status": "healthy", "message": "SnapStyle API is running"}
 
 
 if __name__ == "__main__":
