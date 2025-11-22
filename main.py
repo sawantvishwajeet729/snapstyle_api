@@ -1,106 +1,125 @@
-
-import os
-import json
-import requests
-import re
-import base64
-from functools import lru_cache
-from io import BytesIO
-from typing import List, Optional, Dict, Any
-
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from pydantic_settings import BaseSettings
+from fastapi.responses import JSONResponse
 from PIL import Image
 import google.generativeai as genai
+from io import BytesIO
+import json
+import re
+import base64
+import os
+import requests
+from typing import Optional
 
-# --- 1. Settings Management (Replaces st.secrets) ---
-class Settings(BaseSettings):
-    GOOGLE_API_KEY: str
-    CSE_ID: str
-
-    class Config:
-        env_file = ".env"
-
-@lru_cache
-def get_settings():
-    return Settings()
-
-# --- 2. Configure Google API Key at Startup ---
-try:
-    settings = get_settings()
-    genai.configure(api_key=settings.GOOGLE_API_KEY)
-except Exception as e:
-    print(f"Warning: Could not load .env file. Make sure it exists. Error: {e}")
-
-# --- 3. Initialize FastAPI App ---
 app = FastAPI(title="SnapStyle API")
 
-# Add CORS middleware
+# Enable CORS for your frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://1507cc3e-8646-4587-bcef-865fd8c99e37.lovableproject.com",
-        "http://localhost:5173",  # For local testing
-        "*"  # Or use "*" to allow all origins (less secure)
-    ],
+    allow_origins=["*"],  # In production, replace with your specific domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- 4. Refactored Core Functions ---
+# Initialize Gemini client (make sure to set GOOGLE_API_KEY environment variable)
+client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
-def image_generation(image_bytes: bytes, style: str) -> (bytes, dict):
+# Google Custom Search API credentials (set as environment variables)
+GOOGLE_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "SnapStyle API is running",
+        "endpoints": {
+            "/generate-fashion": "POST - Generate fashion image and description",
+            "/search-products": "POST - Search for fashion products"
+        }
+    }
+
+
+@app.post("/generate-fashion")
+async def generate_fashion(
+    file: UploadFile = File(...),
+    style: str = Form(...)
+):
     """
-    Generates a new fashion image and description from image bytes.
-
+    Generate a fashion image based on uploaded photo and style preference.
+    
     Args:
-        image_bytes: The image file as bytes.
-        style: Style type (e.g., modern, casual).
+        file: Image file (jpg/png)
+        style: Style type (Casual, Modern, Stylish, Traditional)
     
     Returns:
-        A tuple of (image_output_bytes, description_json)
+        JSON with generated image (base64) and outfit description
     """
-    prompt = (
-        f"**Task**: Generate a new fashion image based on the person in the provided image, PLUS a JSON text description of the new outfit.\n"
-        f"**Style**: {style}\n\n"
-        "**Instructions for Generation**:\n"
-        "1.  **Image Analysis**: First, carefully analyze the provided image...\n"
-        "2.  **Outfit Design**: Based on your analysis, design a complete outfit...\n"
-        "3.  **Text Description**: Provide a detailed, search-friendly JSON description...\n\n"
-        "**Required Description Format (JSON)**:\n"
-        "Respond ONLY with a JSON object. Example:\n"
-        "```json\n"
-        "{\n"
-        "  \"Shirt\": \"Men's light wash denim button-up shirt\",\n"
-        "  \"Bottoms\": \"Men's slim-fit olive green chino pants\"\n"
-        "}\n"
-        "```"
-    )
-
     try:
-        # Open image from bytes
-        image = Image.open(BytesIO(image_bytes))
-
-        # Initialize model
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
-        response = model.generate_content([prompt, image])
-
-        generated_image_pil = None
+        # Read and validate image
+        contents = await file.read()
+        image = Image.open(BytesIO(contents))
+        
+        # Validate style
+        valid_styles = ["Casual", "Modern", "Stylish", "Traditional"]
+        if style not in valid_styles:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid style. Choose from: {', '.join(valid_styles)}"
+            )
+        
+        # Create prompt
+        prompt = (
+            f"**Task**: Generate a new fashion image based on the person in the provided image, PLUS a JSON text description of the new outfit.\n"
+            f"**Style**: {style}\n\n"
+            "**Instructions for Generation**:\n"
+            "1.  **Image Analysis**: First, carefully analyze the provided image to understand the person's:\n"
+            "    * **Skin Tone**: Identify their skin complexion.\n"
+            "    * **Body Type**: Assess their general body shape and proportions.\n"
+            "    * **Background Context**: Observe the setting and colors in the background of the original image.\n"
+            "2.  **Outfit Design**: Design a complete outfit that fits the specified '{style}' style, ensuring that:\n"
+            "    * The clothing colors are chosen appropriately to complement the identified skin tone and the overall background context.\n"
+            "    * The outfit flatters the person's body type.\n"
+            "    * The person from the original image is depicted wearing this new outfit.\n"
+            "3.  **Text Description**: Provide a detailed, search-friendly JSON description of the *new* outfit you just created. Each distinct apparel item should be a separate key-value pair. If an item consists of multiple layers (e.g., shirt and t-shirt), list them under appropriate, separate keys.\n\n"
+            "**Required Description Format (JSON)**:\n"
+            "Respond ONLY with a JSON object. Each key should represent a distinct apparel or accessory category. The value for each key should be a search-friendly string description. If an item is not applicable or not visible, omit its key.\n"
+            "Example:\n"
+            "```json\n"
+            "{\n"
+            '  "Shirt": "Men\'s light wash denim button-up shirt",\n'
+            '  "Innerwear": "White crew neck t-shirt",\n'
+            '  "Bottoms": "Men\'s slim-fit olive green chino pants",\n'
+            '  "Shoes": "Men\'s white canvas low-top sneakers",\n'
+            '  "Accessory 1": "Silver watch",\n'
+            '  "Accessory 2": "Brown leather belt"\n'
+            "}\n"
+            "```\n"
+            "Ensure all descriptions are distinct and optimized for product search."
+        )
+        
+        # Generate content using Gemini
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-exp",
+            contents=[prompt, image],
+        )
+        
+        generated_image = None
         description_raw_text = ""
-
-        # Extract text and image from response
+        
+        # Extract image and text from response
         for part in response.candidates[0].content.parts:
-            if hasattr(part, 'text') and part.text:
+            if part.text is not None:
                 description_raw_text += part.text
-            elif hasattr(part, 'inline_data') and part.inline_data:
-                generated_image_pil = Image.open(BytesIO(part.inline_data.data))
-
+            elif part.inline_data is not None:
+                generated_image = Image.open(BytesIO(part.inline_data.data))
+        
+        # Parse JSON description
         description_json = {}
         if description_raw_text:
             try:
+                # Try to extract JSON from markdown code blocks
                 json_match = re.search(r"```json\n(.*?)```", description_raw_text, re.DOTALL)
                 if json_match:
                     json_string = json_match.group(1).strip()
@@ -108,113 +127,104 @@ def image_generation(image_bytes: bytes, style: str) -> (bytes, dict):
                     json_string = description_raw_text.strip()
                 
                 description_json = json.loads(json_string)
-            except json.JSONDecodeError:
-                print(f"Failed to decode JSON from: {description_raw_text}")
-                description_json = {"error": "Failed to parse description JSON"}
+            except json.JSONDecodeError as e:
+                print(f"JSON decode error: {e}")
+                print(f"Raw text: {description_raw_text}")
+                # Return raw text as fallback
+                description_json = {"description": description_raw_text}
         
-        if generated_image_pil:
-            # Convert PIL image to bytes for API response
-            img_buffer = BytesIO()
-            generated_image_pil.save(img_buffer, format="PNG")
-            image_output_bytes = img_buffer.getvalue()
+        # Convert image to base64
+        if generated_image:
+            buffered = BytesIO()
+            generated_image.save(buffered, format="PNG")
+            img_base64 = base64.b64encode(buffered.getvalue()).decode()
             
-            return image_output_bytes, description_json
+            return JSONResponse({
+                "success": True,
+                "image_base64": img_base64,
+                "description": description_json
+            })
         else:
-            raise HTTPException(status_code=500, detail="No image was generated by the model.")
-
+            raise HTTPException(
+                status_code=500,
+                detail="No image was generated"
+            )
+            
     except Exception as e:
-        print(f"Error in image_generation: {e}")
-        raise HTTPException(status_code=500, detail=f"Image generation failed: {e}")
+        print(f"Error in generate_fashion: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating fashion: {str(e)}"
+        )
 
 
-def google_product_search(query: str, api_key: str, cse_id: str, num: int = 5) -> List[Dict[str, Any]]:
-    """Search products and get titles, links, snippets, and images."""
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {
-        "q": query,
-        "key": api_key,
-        "cx": cse_id,
-        "num": num,
-        "searchType": "image"
-    }
-
+@app.post("/search-products")
+async def search_products(description: str = Form(...), num_results: int = Form(5)):
+    """
+    Search for fashion products using Google Custom Search API.
+    
+    Args:
+        description: Product description to search for
+        num_results: Number of results to return (default: 5)
+    
+    Returns:
+        JSON with search results including product links and images
+    """
     try:
+        if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+            raise HTTPException(
+                status_code=500,
+                detail="Google Search API credentials not configured"
+            )
+        
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {
+            "q": description,
+            "key": GOOGLE_API_KEY,
+            "cx": GOOGLE_CSE_ID,
+            "num": min(num_results, 10),  # Google API max is 10
+            "searchType": "image"
+        }
+        
         response = requests.get(url, params=params)
-        response.raise_for_status()
+        
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Google Search API error: {response.text}"
+            )
+        
         data = response.json()
-
+        
         results = []
         for item in data.get("items", []):
             results.append({
                 "title": item.get("title"),
                 "link": item.get("image", {}).get("contextLink"),
-                "image_url": item.get("link"),
-                "thumbnail_url": item.get("image", {}).get("thumbnailLink")
+                "image": item.get("link"),
+                "thumbnail": item.get("image", {}).get("thumbnailLink")
             })
-        return results
-    except requests.RequestException as e:
-        print(f"Error in google_product_search: {e}")
-        raise HTTPException(status_code=500, detail=f"Google Search API request failed: {e}")
-
-
-# --- 5. API Response Models (Pydantic) ---
-class GenerationResponse(BaseModel):
-    description: dict
-    image_base64: str
-
-class SearchItem(BaseModel):
-    title: Optional[str]
-    link: Optional[str]
-    image_url: Optional[str]
-    thumbnail_url: Optional[str]
-
-class SearchResponse(BaseModel):
-    results: List[SearchItem]
-
-# --- 6. API Endpoints ---
-
-@app.post("/generate-fashion", response_model=GenerationResponse)
-async def create_fashion_image(
-    style: str = Form(..., description="The fashion style, e.g., 'casual', 'modern'"),
-    file: UploadFile = File(..., description="The user's input image (PNG or JPG)")
-):
-    """
-    Generates a new fashion image and outfit description.
-    """
-    if not file.content_type in ["image/png", "image/jpeg"]:
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload PNG or JPG.")
-
-    image_bytes = await file.read()
-    
-    generated_image_bytes, description_json = image_generation(image_bytes, style)
-    
-    image_base64_string = base64.b64encode(generated_image_bytes).decode('utf-8')
-    
-    return GenerationResponse(
-        description=description_json,
-        image_base64=image_base64_string
-    )
-
-
-@app.get("/search-products", response_model=SearchResponse)
-async def search_for_products(
-    query: str,
-    settings: Settings = Depends(get_settings)
-):
-    """
-    Searches for products using the Google Custom Search Engine.
-    """
-    if not query:
-        raise HTTPException(status_code=400, detail="A 'query' parameter is required.")
         
-    search_results = google_product_search(
-        query=query,
-        api_key=settings.GOOGLE_API_KEY,
-        cse_id=settings.CSE_ID,
-        num=5
-    )
-    return SearchResponse(results=search_results)
+        return JSONResponse({
+            "success": True,
+            "results": results,
+            "query": description
+        })
+        
+    except Exception as e:
+        print(f"Error in search_products: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error searching products: {str(e)}"
+        )
 
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the SnapStyle API. Go to /docs for more."}
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring"""
+    return {"status": "healthy"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
