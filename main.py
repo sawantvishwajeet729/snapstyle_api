@@ -16,7 +16,8 @@ app = FastAPI(title="SnapStyle API")
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://id-preview--1507cc3e-8646-4587-bcef-865fd8c99e37.lovable.app",
+        "http://localhost:5173",],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
